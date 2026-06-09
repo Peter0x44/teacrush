@@ -20,6 +20,8 @@ go install github.com/zeozeozeo/teacrush@latest
 
 ## Usage
 
+You can use Teacrush through the terminal or by creating a desktop shortcut you can simply drag the videos you want to compress on top of it (on Windows, at least)
+
 ```
 $ teacrush -h
 Teacrush
