@@ -52,3 +52,17 @@ Flags:
 [^1]: P = `-preset`
 
 [^2]: S = `-speed`
+
+## CRF level mapping
+
+| Encoder / HW | FFmpeg Parameter | Value Range |
+| :--- | :--- | :---: |
+| **SVT-AV1** | `-crf` | `20 - 50` |
+| **AOM-AV1** | `-crf` | `20 - 50` |
+| **rav1e** | `-crf` | `60 - 140` |
+| **VP9** | `-crf` | `20 - 45` |
+| **H.264** | `-crf` | `18 - 33` |
+| **H.265** | `-crf` | `20 - 36` |
+| **NVENC** | `-cq` | `19 - 34` |
+| **AMF** | `-qp_i` / `-qp_p` | `19 - 34` |
+| **QSV** | `-global_quality` | `19 - 34` |
