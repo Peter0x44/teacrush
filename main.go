@@ -20,8 +20,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+const (
+	appMarginY = 1
+	appMarginX = 2
+)
+
 var (
-	appStyle = lipgloss.NewStyle().Margin(1, 2)
+	appStyle = lipgloss.NewStyle().Margin(appMarginY, appMarginX)
 
 	titleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFF")).
@@ -45,6 +50,11 @@ var (
 			Padding(0, 1).
 			Foreground(lipgloss.Color("245")).
 			Width(78)
+
+	previewBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Padding(0, 1)
 )
 
 type state int
@@ -54,6 +64,8 @@ const (
 	stateInputSize
 	stateInputRes
 	stateFPS
+	stateInputTrim
+	stateInputCrop
 	stateSelectHW
 	stateSelectCodec
 	stateSelectCRF
@@ -119,6 +131,19 @@ type workDoneMsg struct {
 	err        error
 }
 
+type clipInfoMsg struct {
+	duration float64
+	err      error
+}
+
+type framePreviewMsg struct {
+	time    float64
+	width   int
+	height  int
+	preview string
+	err     error
+}
+
 type outputMode int
 
 const (
@@ -145,6 +170,11 @@ type model struct {
 	targetFPS     string // empty = real
 	trimStart     string
 	trimEnd       string
+	trimStartSec  float64
+	trimEndSec    float64
+	trimHandle    int // 0 = start, 1 = end
+	trimDragging  bool
+	cropInput     string
 	selectedHW    int
 	selectedCodec int
 	crfLevel      int // 0 to 10
@@ -156,6 +186,17 @@ type model struct {
 	percent      float64
 	outputFile   string
 	finalSize    string
+
+	videoDuration   float64
+	clipInfoLoading bool
+	previewTime     float64
+	previewWidth    int
+	previewHeight   int
+	previewLoading  bool
+	framePreview    string
+	previewError    string
+	windowWidth     int
+	windowHeight    int
 
 	suggestions   []string
 	suggestionIdx int
@@ -209,6 +250,13 @@ func initialModel(mode outputMode) model {
 				continue
 			}
 		}
+		if arg == "-crop" {
+			if i+1 < len(args) {
+				m.cropInput = args[i+1]
+				skip = 1
+				continue
+			}
+		}
 
 		clean := cleanPath(arg)
 		if fi, err := os.Stat(clean); err == nil {
@@ -241,6 +289,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		oldPreviewWidth, oldPreviewHeight := m.previewDimensions()
+		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
+		newPreviewWidth, newPreviewHeight := m.previewDimensions()
+		if m.state == stateInputTrim && !m.clipInfoLoading && (oldPreviewWidth != newPreviewWidth || oldPreviewHeight != newPreviewHeight) {
+			return m.loadCurrentPreview()
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if updated, mouseCmd, handled := m.handleTrimMouse(msg); handled {
+			return updated, mouseCmd
+		}
+
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
 			return m, tea.Quit
@@ -319,30 +382,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case stateFPS:
 			if msg.Type == tea.KeyEnter {
-				m.targetFPS = m.textInput.Value()
+				m.targetFPS = strings.TrimSpace(m.textInput.Value())
+				m.textInput.Reset()
 				m.textInput.Blur()
+				m.state = stateInputTrim
+				m.clipInfoLoading = true
+				m.previewLoading = false
+				m.framePreview = ""
+				m.previewError = ""
+				m.err = nil
+				return m, loadClipInfo(m.filePath)
+			}
 
-				if m.outputMode == modeGIF || m.outputMode == modeAPNG {
-					m.state = stateProcessing
-					m.progressChan = make(chan progressMsg)
-					var codecCfg codecInfo
-					switch m.outputMode {
-					case modeGIF:
-						codecCfg = codecInfo{Name: "GIF", Ext: ".gif"}
-					case modeAPNG:
-						codecCfg = codecInfo{Name: "APNG", Ext: ".png"}
-					}
+		case stateInputTrim:
+			if m.clipInfoLoading {
+				return m, nil
+			}
 
-					return m, tea.Batch(
-						m.spinner.Tick,
-						startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.customOut, hwCPU, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
-						waitForProgress(m.progressChan),
-					)
-				} else {
-					m.state = stateSelectHW
-					m.textInput.Blur()
+			switch msg.String() {
+			case "left", "h", "a":
+				m = m.moveTrimHandle(-m.trimStep(false))
+				return m.loadCurrentPreview()
+			case "right", "l", "d":
+				m = m.moveTrimHandle(m.trimStep(false))
+				return m.loadCurrentPreview()
+			case "shift+left", "ctrl+left", "pgup":
+				m = m.moveTrimHandle(-m.trimStep(true))
+				return m.loadCurrentPreview()
+			case "shift+right", "ctrl+right", "pgdown":
+				m = m.moveTrimHandle(m.trimStep(true))
+				return m.loadCurrentPreview()
+			case "tab":
+				m.trimHandle = 1 - m.trimHandle
+				return m.loadCurrentPreview()
+			case "r":
+				m = m.resetTrimSelection()
+				return m.loadCurrentPreview()
+			case "enter":
+				m = m.commitTrimSelection()
+				m.textInput.Reset()
+				m.textInput.Focus()
+				m.state = stateInputCrop
+				m.textInput.Placeholder = "Enter=No crop, square, 1280x720, or 1280x720+0+0"
+				if m.cropInput != "" {
+					m.textInput.SetValue(m.cropInput)
 				}
 				m.err = nil
+			}
+
+		case stateInputCrop:
+			if msg.Type == tea.KeyEnter {
+				crop := strings.TrimSpace(m.textInput.Value())
+				if _, err := buildCropFilter(crop); err != nil {
+					m.err = err
+				} else {
+					m.cropInput = crop
+					m.textInput.Blur()
+
+					if m.outputMode == modeGIF || m.outputMode == modeAPNG {
+						m.state = stateProcessing
+						m.progressChan = make(chan progressMsg)
+						var codecCfg codecInfo
+						switch m.outputMode {
+						case modeGIF:
+							codecCfg = codecInfo{Name: "GIF", Ext: ".gif"}
+						case modeAPNG:
+							codecCfg = codecInfo{Name: "APNG", Ext: ".png"}
+						}
+
+						return m, tea.Batch(
+							m.spinner.Tick,
+							startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.cropInput, m.customOut, hwCPU, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
+							waitForProgress(m.progressChan),
+						)
+					} else {
+						m.state = stateSelectHW
+					}
+					m.err = nil
+				}
 			}
 
 		case stateSelectHW:
@@ -436,7 +553,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				return m, tea.Batch(
 					m.spinner.Tick,
-					startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.customOut, hw, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
+					startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.cropInput, m.customOut, hw, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
 					waitForProgress(m.progressChan),
 				)
 			}
@@ -463,6 +580,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Quit
 
+	case clipInfoMsg:
+		m.clipInfoLoading = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m = m.initializeTrimSelection(msg.duration)
+		return m.loadCurrentPreview()
+
+	case framePreviewMsg:
+		if math.Abs(msg.time-m.previewTime) > 0.01 || msg.width != m.previewWidth || msg.height != m.previewHeight {
+			return m, nil
+		}
+		m.previewLoading = false
+		if msg.err != nil {
+			m.previewError = msg.err.Error()
+			return m, nil
+		}
+		m.framePreview = msg.preview
+		m.previewError = ""
+		return m, nil
+
 	case spinner.TickMsg:
 		if m.state == stateProcessing {
 			m.spinner, cmd = m.spinner.Update(msg)
@@ -470,7 +609,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.state == stateInputFile || m.state == stateInputSize || m.state == stateInputRes || m.state == stateFPS {
+	if m.state == stateInputFile || m.state == stateInputSize || m.state == stateInputRes || m.state == stateFPS || m.state == stateInputCrop {
 		m.textInput, cmd = m.textInput.Update(msg)
 	}
 
@@ -492,6 +631,9 @@ func (m model) View() string {
 	s.WriteString(titleStyle.Render(title))
 	if m.trimStart != "" {
 		s.WriteString(fmt.Sprintf(" [Trim: %s-%s]", m.trimStart, m.trimEnd))
+	}
+	if m.cropInput != "" {
+		s.WriteString(fmt.Sprintf(" [Crop: %s]", m.cropInput))
 	}
 	s.WriteString("\n\n")
 
@@ -535,8 +677,42 @@ func (m model) View() string {
 		s.WriteString("\nEnter a number (e.g. 30, 60) to set FPS.\n\n")
 		s.WriteString(m.textInput.View())
 
+	case stateInputTrim:
+		s.WriteString(stepStyle.Render("5. Trim Clip"))
+		if m.clipInfoLoading {
+			s.WriteString("\nReading clip duration...")
+			break
+		}
+
+		active := "start"
+		if m.trimHandle == 1 {
+			active = "end"
+		}
+		s.WriteString(fmt.Sprintf("\n%s: %s  %s: %s  duration: %s", labelForHandle("start", m.trimHandle == 0), formatDuration(m.trimStartSec), labelForHandle("end", m.trimHandle == 1), formatDuration(m.trimEndSec), formatDuration(math.Max(0, m.trimEndSec-m.trimStartSec))))
+		s.WriteString("\n")
+		s.WriteString(m.renderTrimSlider(m.trimSliderWidth()))
+		s.WriteString(fmt.Sprintf("\n\nEditing %s handle. Drag slider or use Left/Right, PgUp/PgDn, Tab, R, Enter.\n\n", active))
+
+		if m.previewLoading && m.framePreview == "" {
+			s.WriteString(itemStyle.Render("Loading frame preview..."))
+		} else if m.previewError != "" {
+			s.WriteString(itemStyle.Render("Preview unavailable: " + m.previewError))
+		} else if m.framePreview != "" {
+			caption := fmt.Sprintf("Frame at %s", formatDuration(m.previewTime))
+			if m.previewLoading {
+				caption += " (updating)"
+			}
+			s.WriteString(previewBoxStyle.Render(caption + "\n" + m.framePreview))
+		}
+
+	case stateInputCrop:
+		s.WriteString(stepStyle.Render("6. Crop Frame"))
+		s.WriteString("\nLeave empty to keep the full frame.")
+		s.WriteString("\nUse square, WxH, WxH+X+Y, or ffmpeg crop=W:H:X:Y.\n\n")
+		s.WriteString(m.textInput.View())
+
 	case stateSelectHW:
-		s.WriteString(stepStyle.Render("5. Select Hardware"))
+		s.WriteString(stepStyle.Render("7. Select Hardware"))
 		if m.targetSizeMB > 0 {
 			s.WriteString(fmt.Sprintf("\nTarget: %.2f MB\n\n", m.targetSizeMB))
 		} else {
@@ -553,7 +729,7 @@ func (m model) View() string {
 		}
 
 	case stateSelectCodec:
-		s.WriteString(stepStyle.Render("6. Select Codec"))
+		s.WriteString(stepStyle.Render("8. Select Codec"))
 		if m.outputMode == modeAVIF {
 			s.WriteString(" (AV1 only)")
 		}
@@ -582,7 +758,7 @@ func (m model) View() string {
 		}
 
 	case stateSelectCRF:
-		s.WriteString(stepStyle.Render("7. Quality (CRF)"))
+		s.WriteString(stepStyle.Render("9. Quality (CRF)"))
 		s.WriteString("\nAdjust the Constant Rate Factor (CRF).")
 		s.WriteString("\n\n")
 
@@ -603,9 +779,9 @@ func (m model) View() string {
 		s.WriteString("\nPress Enter to continue.")
 
 	case stateSelectQuality:
-		stepNum := "7"
+		stepNum := "9"
 		if m.targetSizeMB <= 0 {
-			stepNum = "8"
+			stepNum = "10"
 		}
 		s.WriteString(stepStyle.Render(stepNum + ". Select Encoding Speed"))
 		s.WriteString("\nUse Left/Right to adjust.")
@@ -676,6 +852,358 @@ func waitForProgress(sub <-chan progressMsg) tea.Cmd {
 	}
 }
 
+func loadClipInfo(path string) tea.Cmd {
+	return func() tea.Msg {
+		info, err := probeFile(path)
+		if err != nil {
+			return clipInfoMsg{err: err}
+		}
+		duration, err := strconv.ParseFloat(info.Format.Duration, 64)
+		if err != nil || duration <= 0 {
+			return clipInfoMsg{err: fmt.Errorf("could not read clip duration")}
+		}
+		return clipInfoMsg{duration: duration}
+	}
+}
+
+func loadFramePreview(path string, at float64, width int, height int) tea.Cmd {
+	return func() tea.Msg {
+		preview, err := renderFramePreview(path, at, width, height)
+		return framePreviewMsg{time: at, width: width, height: height, preview: preview, err: err}
+	}
+}
+
+func (m model) initializeTrimSelection(duration float64) model {
+	m.videoDuration = duration
+	m.trimHandle = 0
+	m.trimStartSec = 0
+	m.trimEndSec = duration
+
+	if m.trimStart != "" || m.trimEnd != "" {
+		start, errStart := parseDurationStrict(m.trimStart)
+		end, errEnd := parseDurationStrict(m.trimEnd)
+		if errStart == nil && errEnd == nil && end > start {
+			m.trimStartSec = clampFloat(start, 0, duration)
+			m.trimEndSec = clampFloat(end, m.trimStartSec, duration)
+		}
+	}
+
+	m = m.commitTrimSelection()
+	return m
+}
+
+func (m model) resetTrimSelection() model {
+	m.trimStartSec = 0
+	m.trimEndSec = m.videoDuration
+	m.trimHandle = 0
+	m = m.commitTrimSelection()
+	return m
+}
+
+func (m model) moveTrimHandle(delta float64) model {
+	if m.videoDuration <= 0 {
+		return m
+	}
+
+	minGap := math.Min(0.1, m.videoDuration)
+	if m.trimHandle == 0 {
+		m.trimStartSec = clampFloat(m.trimStartSec+delta, 0, math.Max(0, m.trimEndSec-minGap))
+	} else {
+		m.trimEndSec = clampFloat(m.trimEndSec+delta, math.Min(m.videoDuration, m.trimStartSec+minGap), m.videoDuration)
+	}
+
+	m = m.commitTrimSelection()
+	return m
+}
+
+func (m model) trimStep(big bool) float64 {
+	if m.videoDuration <= 0 {
+		return 1
+	}
+	step := math.Max(0.25, m.videoDuration/200)
+	if big {
+		step = math.Max(1, m.videoDuration/40)
+	}
+	return step
+}
+
+func (m model) commitTrimSelection() model {
+	if m.videoDuration <= 0 || (m.trimStartSec <= 0 && math.Abs(m.trimEndSec-m.videoDuration) < 0.01) {
+		m.trimStart = ""
+		m.trimEnd = ""
+		return m
+	}
+	m.trimStart = formatDuration(m.trimStartSec)
+	m.trimEnd = formatDuration(m.trimEndSec)
+	return m
+}
+
+func (m model) activeTrimTime() float64 {
+	if m.trimHandle == 1 {
+		return m.trimEndSec
+	}
+	return m.trimStartSec
+}
+
+func (m model) loadCurrentPreview() (model, tea.Cmd) {
+	at := m.activeTrimTime()
+	if m.videoDuration > 0 {
+		at = clampFloat(at, 0, math.Max(0, m.videoDuration-0.05))
+	}
+	width, height := m.previewDimensions()
+	m.previewTime = at
+	m.previewWidth = width
+	m.previewHeight = height
+	m.previewLoading = true
+	m.previewError = ""
+	return m, loadFramePreview(m.filePath, at, width, height)
+}
+
+func (m model) handleTrimMouse(msg tea.MouseMsg) (model, tea.Cmd, bool) {
+	if m.state != stateInputTrim || m.clipInfoLoading || m.videoDuration <= 0 {
+		return m, nil, false
+	}
+
+	event := tea.MouseEvent(msg)
+	switch event.Action {
+	case tea.MouseActionPress:
+		if event.Button != tea.MouseButtonLeft || !m.mouseOnTrimSlider(event.X, event.Y) {
+			return m, nil, false
+		}
+		m.trimDragging = true
+		m, changed := m.setTrimHandleFromX(event.X, true)
+		if changed {
+			updated, cmd := m.loadCurrentPreview()
+			return updated, cmd, true
+		}
+		return m, nil, true
+
+	case tea.MouseActionMotion:
+		if !m.trimDragging {
+			return m, nil, false
+		}
+		m, changed := m.setTrimHandleFromX(event.X, false)
+		if changed {
+			updated, cmd := m.loadCurrentPreview()
+			return updated, cmd, true
+		}
+		return m, nil, true
+
+	case tea.MouseActionRelease:
+		if !m.trimDragging {
+			return m, nil, false
+		}
+		m.trimDragging = false
+		return m, nil, true
+	}
+
+	return m, nil, false
+}
+
+func (m model) setTrimHandleFromX(x int, chooseNearest bool) (model, bool) {
+	if m.videoDuration <= 0 {
+		return m, false
+	}
+
+	sliderX, _ := m.trimSliderOrigin()
+	width := m.trimSliderWidth()
+	pos := clampInt(x-sliderX, 0, width-1)
+	seconds := (float64(pos) / float64(width-1)) * m.videoDuration
+
+	if chooseNearest {
+		if math.Abs(seconds-m.trimEndSec) < math.Abs(seconds-m.trimStartSec) {
+			m.trimHandle = 1
+		} else {
+			m.trimHandle = 0
+		}
+	}
+
+	oldActive := m.activeTrimTime()
+	minGap := math.Min(0.1, m.videoDuration)
+	if m.trimHandle == 0 {
+		m.trimStartSec = clampFloat(seconds, 0, math.Max(0, m.trimEndSec-minGap))
+	} else {
+		m.trimEndSec = clampFloat(seconds, math.Min(m.videoDuration, m.trimStartSec+minGap), m.videoDuration)
+	}
+	m = m.commitTrimSelection()
+
+	return m, math.Abs(m.activeTrimTime()-oldActive) >= 0.01
+}
+
+func (m model) mouseOnTrimSlider(x int, y int) bool {
+	sliderX, sliderY := m.trimSliderOrigin()
+	width := m.trimSliderWidth()
+	return y >= sliderY-1 && y <= sliderY+1 && x >= sliderX && x < sliderX+width
+}
+
+func (m model) trimSliderOrigin() (int, int) {
+	errorRows := 0
+	if m.err != nil {
+		errorRows = 2
+	}
+	return appMarginX, appMarginY + errorRows + 4
+}
+
+func (m model) trimSliderWidth() int {
+	if m.windowWidth <= 0 {
+		return 58
+	}
+	return clampInt(m.windowWidth-(appMarginX*2)-4, 30, 100)
+}
+
+func (m model) previewDimensions() (int, int) {
+	width := 72
+	if m.windowWidth > 0 {
+		width = m.windowWidth - (appMarginX * 2) - 6
+	}
+	width = clampInt(width, 48, 120)
+
+	height := int(math.Round(float64(width) * 9 / 16))
+	height = clampInt(height, 24, 56)
+	if m.windowHeight > 0 {
+		availableRows := m.windowHeight - (appMarginY * 2) - 12
+		maxHeight := math.Max(18, float64(availableRows*2))
+		height = int(math.Min(float64(height), maxHeight))
+	}
+	if height%2 != 0 {
+		height--
+	}
+	if height < 18 {
+		height = 18
+	}
+
+	return width, height
+}
+
+func (m model) renderTrimSlider(width int) string {
+	if width < 12 {
+		width = 12
+	}
+	if m.videoDuration <= 0 {
+		return progressEmptyStyle.Render(strings.Repeat("-", width))
+	}
+
+	startPos := int(math.Round((m.trimStartSec / m.videoDuration) * float64(width-1)))
+	endPos := int(math.Round((m.trimEndSec / m.videoDuration) * float64(width-1)))
+	startPos = clampInt(startPos, 0, width-1)
+	endPos = clampInt(endPos, startPos, width-1)
+
+	var b strings.Builder
+	for i := 0; i < width; i++ {
+		ch := "─"
+		style := progressEmptyStyle
+		if i >= startPos && i <= endPos {
+			style = progressFullStyle
+		}
+		if i == startPos {
+			ch = "◀"
+			if m.trimHandle == 0 {
+				style = selectedItemStyle
+			}
+		}
+		if i == endPos {
+			ch = "▶"
+			if m.trimHandle == 1 {
+				style = selectedItemStyle
+			}
+		}
+		b.WriteString(style.Render(ch))
+	}
+	return b.String()
+}
+
+func renderFramePreview(path string, at float64, width int, height int) (string, error) {
+	if width <= 0 || height <= 0 {
+		return "", fmt.Errorf("invalid preview size")
+	}
+
+	args := []string{
+		"-v", "error",
+		"-ss", formatDuration(at),
+		"-i", path,
+		"-frames:v", "1",
+		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=decrease:flags=lanczos,pad=%d:%d:(ow-iw)/2:(oh-ih)/2", width, height, width, height),
+		"-f", "rawvideo",
+		"-pix_fmt", "rgb24",
+		"-",
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	needed := width * height * 3
+	if len(out) < needed {
+		return "", fmt.Errorf("ffmpeg returned an incomplete preview frame")
+	}
+
+	var b strings.Builder
+	for y := 0; y < height; y += 2 {
+		for x := 0; x < width; x++ {
+			top := (y*width + x) * 3
+			bottomY := y + 1
+			bottom := top
+			if bottomY < height {
+				bottom = (bottomY*width + x) * 3
+			}
+			b.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", out[top], out[top+1], out[top+2], out[bottom], out[bottom+1], out[bottom+2]))
+		}
+		b.WriteString("\x1b[0m")
+		if y+2 < height {
+			b.WriteByte('\n')
+		}
+	}
+
+	return b.String(), nil
+}
+
+func formatDuration(sec float64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	hours := int(sec) / 3600
+	minutes := (int(sec) % 3600) / 60
+	seconds := math.Mod(sec, 60)
+	if hours > 0 {
+		return fmt.Sprintf("%d:%02d:%05.2f", hours, minutes, seconds)
+	}
+	return fmt.Sprintf("%d:%05.2f", minutes, seconds)
+}
+
+func clampFloat(value, min, max float64) float64 {
+	if max < min {
+		return min
+	}
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func clampInt(value, min, max int) int {
+	if max < min {
+		return min
+	}
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func labelForHandle(label string, active bool) string {
+	if active {
+		return selectedItemStyle.Render(label)
+	}
+	return itemStyle.Render(label)
+}
+
 func buildScaleFilter(input string) string {
 	input = strings.TrimSpace(input)
 	if input == "" || input == "1" {
@@ -692,19 +1220,109 @@ func buildScaleFilter(input string) string {
 }
 
 func parseDuration(s string) float64 {
-	s = strings.TrimSuffix(s, "s")
+	sec, _ := parseDurationStrict(s)
+	return sec
+}
+
+func parseDurationStrict(s string) (float64, error) {
+	s = strings.TrimSpace(strings.TrimSuffix(s, "s"))
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
 	parts := strings.Split(s, ":")
 	sec := 0.0
 	mul := 1.0
 	for i := len(parts) - 1; i >= 0; i-- {
-		v, _ := strconv.ParseFloat(parts[i], 64)
+		v, err := strconv.ParseFloat(parts[i], 64)
+		if err != nil || v < 0 {
+			return 0, fmt.Errorf("invalid duration: %s", s)
+		}
 		sec += v * mul
 		mul *= 60
 	}
-	return sec
+	return sec, nil
 }
 
-func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput string, trimStart, trimEnd, customOut string, hw hwType, codecCfg codecInfo, progressChan chan progressMsg, mode outputMode, quality int, crfSlider int) tea.Cmd {
+func parseTrimInput(input string) (string, string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", nil
+	}
+
+	fields := strings.Fields(input)
+	if len(fields) != 2 && strings.Contains(input, "-") {
+		parts := strings.SplitN(input, "-", 2)
+		fields = []string{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])}
+	}
+	if len(fields) != 2 || fields[0] == "" || fields[1] == "" {
+		return "", "", fmt.Errorf("trim must be empty or two times, e.g. 00:01 00:05")
+	}
+
+	start, err := parseDurationStrict(fields[0])
+	if err != nil {
+		return "", "", err
+	}
+	end, err := parseDurationStrict(fields[1])
+	if err != nil {
+		return "", "", err
+	}
+	if end <= start {
+		return "", "", fmt.Errorf("trim end must be after trim start")
+	}
+
+	return fields[0], fields[1], nil
+}
+
+func buildCropFilter(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" || input == "1" {
+		return "", nil
+	}
+
+	lower := strings.ToLower(input)
+	if lower == "none" || lower == "no" {
+		return "", nil
+	}
+	if lower == "square" || lower == "1:1" {
+		return "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2", nil
+	}
+	if strings.HasPrefix(lower, "crop=") {
+		return input, nil
+	}
+
+	if strings.Contains(input, "+") {
+		parts := strings.Split(input, "+")
+		if len(parts) != 3 {
+			return "", fmt.Errorf("crop must be empty, square, WxH, WxH+X+Y, or crop=W:H:X:Y")
+		}
+		wh := splitDimension(parts[0])
+		if len(wh) != 2 || wh[0] == "" || wh[1] == "" || parts[1] == "" || parts[2] == "" {
+			return "", fmt.Errorf("crop must be empty, square, WxH, WxH+X+Y, or crop=W:H:X:Y")
+		}
+		return fmt.Sprintf("crop=%s:%s:%s:%s", wh[0], wh[1], parts[1], parts[2]), nil
+	}
+
+	if strings.ContainsAny(input, "xX") {
+		wh := splitDimension(input)
+		if len(wh) != 2 || wh[0] == "" || wh[1] == "" {
+			return "", fmt.Errorf("crop must be empty, square, WxH, WxH+X+Y, or crop=W:H:X:Y")
+		}
+		return fmt.Sprintf("crop=%s:%s:(iw-%s)/2:(ih-%s)/2", wh[0], wh[1], wh[0], wh[1]), nil
+	}
+
+	if strings.Contains(input, ":") {
+		return "crop=" + input, nil
+	}
+
+	return "", fmt.Errorf("crop must be empty, square, WxH, WxH+X+Y, or crop=W:H:X:Y")
+}
+
+func splitDimension(input string) []string {
+	input = strings.ReplaceAll(input, "X", "x")
+	return strings.Split(input, "x")
+}
+
+func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput string, trimStart, trimEnd, cropInput, customOut string, hw hwType, codecCfg codecInfo, progressChan chan progressMsg, mode outputMode, quality int, crfSlider int) tea.Cmd {
 	return func() tea.Msg {
 		defer close(progressChan)
 
@@ -717,10 +1335,18 @@ func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput
 		duration, _ := strconv.ParseFloat(info.Format.Duration, 64)
 
 		if trimStart != "" && trimEnd != "" {
-			s := parseDuration(trimStart)
-			e := parseDuration(trimEnd)
+			s, err := parseDurationStrict(trimStart)
+			if err != nil {
+				return workDoneMsg{err: err}
+			}
+			e, err := parseDurationStrict(trimEnd)
+			if err != nil {
+				return workDoneMsg{err: err}
+			}
 			if e > s {
 				duration = e - s
+			} else {
+				return workDoneMsg{err: fmt.Errorf("trim end must be after trim start")}
 			}
 		}
 
@@ -757,9 +1383,16 @@ func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput
 			formatArgs = append(formatArgs, "-movflags", "+faststart")
 		}
 
+		cropFilter, err := buildCropFilter(cropInput)
+		if err != nil {
+			return workDoneMsg{err: err}
+		}
 		scaleFilter := buildScaleFilter(resInput)
 
 		vfFilters := []string{}
+		if cropFilter != "" {
+			vfFilters = append(vfFilters, cropFilter)
+		}
 		if scaleFilter != "" {
 			vfFilters = append(vfFilters, scaleFilter)
 		}
@@ -778,6 +1411,9 @@ func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput
 		switch mode {
 		case modeGIF:
 			gifVf := []string{}
+			if cropFilter != "" {
+				gifVf = append(gifVf, cropFilter)
+			}
 			if scaleFilter != "" {
 				gifVf = append(gifVf, scaleFilter)
 			}
@@ -835,6 +1471,9 @@ func startEncoding(inputFile string, targetMB float64, resInput string, fpsInput
 		case modeAPNG:
 			progressChan <- progressMsg{line: "Encoding APNG...", progress: 0.1}
 			apngVf := []string{}
+			if cropFilter != "" {
+				apngVf = append(apngVf, cropFilter)
+			}
 			if scaleFilter != "" {
 				apngVf = append(apngVf, scaleFilter)
 			}
@@ -1203,6 +1842,7 @@ func printHelp() {
 	fmt.Println("  -o [file]           Output file path")
 	fmt.Println("  -v                  Verbose mode (show command)")
 	fmt.Println("  -trim [start] [end] Trim video (e.g. -trim 00:01:00 00:02:00 or -trim 1s 5s)")
+	fmt.Println("  -crop [crop]        Crop video (square, 1280x720, 1280x720+0+0, or crop=W:H:X:Y)")
 	fmt.Println("  -h, --help, ?       Show this help message")
 }
 
@@ -1233,7 +1873,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(outputMode))
+	p := tea.NewProgram(initialModel(outputMode), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
