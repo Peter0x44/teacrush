@@ -486,21 +486,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateInputCrop:
 			switch msg.String() {
 			case "left", "h", "a":
-				m = m.moveCrop(-m.cropStep(false), 0)
+				m = m.moveCrop(-m.cropStepX(false), 0)
 			case "right", "l", "d":
-				m = m.moveCrop(m.cropStep(false), 0)
+				m = m.moveCrop(m.cropStepX(false), 0)
 			case "up", "k", "w":
-				m = m.moveCrop(0, -m.cropStep(false))
+				m = m.moveCrop(0, -m.cropStepY(false))
 			case "down", "j", "s":
-				m = m.moveCrop(0, m.cropStep(false))
+				m = m.moveCrop(0, m.cropStepY(false))
 			case "shift+left", "ctrl+left", "pgup":
-				m = m.resizeCrop(-m.cropStep(true), 0)
+				m = m.resizeCrop(-m.cropStepX(true), 0)
 			case "shift+right", "ctrl+right", "pgdown":
-				m = m.resizeCrop(m.cropStep(true), 0)
+				m = m.resizeCrop(m.cropStepX(true), 0)
 			case "shift+up", "ctrl+up":
-				m = m.resizeCrop(0, -m.cropStep(true))
+				m = m.resizeCrop(0, -m.cropStepY(true))
 			case "shift+down", "ctrl+down":
-				m = m.resizeCrop(0, m.cropStep(true))
+				m = m.resizeCrop(0, m.cropStepY(true))
 			case "r":
 				m = m.resetCropSelection()
 			case "q":
@@ -1386,10 +1386,35 @@ func (m model) cropPreviewOverlay() previewOverlay {
 	return previewOverlay{x: x, y: y, w: w, h: h, sourceWidth: m.videoWidth, sourceHeight: m.videoHeight, dimOutside: true}
 }
 
-func (m model) cropStep(big bool) int {
-	base := maxInt(1, minInt(m.videoWidth, m.videoHeight)/200)
+func (m model) cropStepX(big bool) int {
+	step := m.cropStepForAxis(false, m.previewWidth, m.videoWidth, 1, 6)
 	if big {
-		base = maxInt(8, minInt(m.videoWidth, m.videoHeight)/40)
+		return evenInt(step * 2)
+	}
+	return step
+}
+
+func (m model) cropStepY(big bool) int {
+	step := m.cropStepForAxis(false, m.previewHeight, m.videoHeight, 1, 3)
+	if big {
+		return evenInt(step * 2)
+	}
+	return step
+}
+
+func (m model) cropStepForAxis(big bool, previewSize int, sourceSize int, cells int, divisor int) int {
+	if previewSize > 0 && sourceSize > 0 {
+		step := previewDeltaToSource(cells, previewSize, sourceSize)
+		step = maxInt(2, step/divisor)
+		if big {
+			step *= 5
+		}
+		return evenInt(maxInt(2, step))
+	}
+
+	base := maxInt(2, minInt(m.videoWidth, m.videoHeight)/100)
+	if big {
+		base = maxInt(12, minInt(m.videoWidth, m.videoHeight)/25)
 	}
 	return evenInt(base)
 }
