@@ -25,6 +25,21 @@ const (
 	appMarginX = 2
 )
 
+type cropDragMode int
+
+const (
+	cropDragNone cropDragMode = iota
+	cropDragMove
+	cropDragLeft
+	cropDragRight
+	cropDragTop
+	cropDragBottom
+	cropDragTopLeft
+	cropDragTopRight
+	cropDragBottomLeft
+	cropDragBottomRight
+)
+
 var (
 	appStyle = lipgloss.NewStyle().Margin(appMarginY, appMarginX)
 
@@ -133,15 +148,34 @@ type workDoneMsg struct {
 
 type clipInfoMsg struct {
 	duration float64
+	width    int
+	height   int
 	err      error
 }
 
 type framePreviewMsg struct {
-	time    float64
-	width   int
-	height  int
-	preview string
-	err     error
+	time   float64
+	width  int
+	height int
+	seq    int
+	pixels []byte
+	err    error
+}
+
+type previewOverlay struct {
+	x            int
+	y            int
+	w            int
+	h            int
+	sourceWidth  int
+	sourceHeight int
+	dimOutside   bool
+}
+
+type cropHandle struct {
+	x    int
+	y    int
+	mode cropDragMode
 }
 
 type outputMode int
@@ -175,6 +209,20 @@ type model struct {
 	trimHandle    int // 0 = start, 1 = end
 	trimDragging  bool
 	cropInput     string
+	cropEnabled   bool
+	cropX         int
+	cropY         int
+	cropW         int
+	cropH         int
+	cropDragMode  cropDragMode
+	cropDragStart struct {
+		mouseX int
+		mouseY int
+		x      int
+		y      int
+		w      int
+		h      int
+	}
 	selectedHW    int
 	selectedCodec int
 	crfLevel      int // 0 to 10
@@ -188,11 +236,15 @@ type model struct {
 	finalSize    string
 
 	videoDuration   float64
+	videoWidth      int
+	videoHeight     int
 	clipInfoLoading bool
 	previewTime     float64
 	previewWidth    int
 	previewHeight   int
+	previewSeq      int
 	previewLoading  bool
+	previewPixels   []byte
 	framePreview    string
 	previewError    string
 	windowWidth     int
@@ -301,6 +353,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if updated, mouseCmd, handled := m.handleTrimMouse(msg); handled {
+			return updated, mouseCmd
+		}
+		if updated, mouseCmd, handled := m.handleCropMouse(msg); handled {
 			return updated, mouseCmd
 		}
 
@@ -421,46 +476,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				m = m.commitTrimSelection()
 				m.textInput.Reset()
-				m.textInput.Focus()
+				m.textInput.Blur()
+				m = m.initializeCropSelection()
 				m.state = stateInputCrop
-				m.textInput.Placeholder = "Enter=No crop, square, 1280x720, or 1280x720+0+0"
-				if m.cropInput != "" {
-					m.textInput.SetValue(m.cropInput)
-				}
+				m.framePreview = m.renderPreviewWithCrop()
 				m.err = nil
 			}
 
 		case stateInputCrop:
-			if msg.Type == tea.KeyEnter {
-				crop := strings.TrimSpace(m.textInput.Value())
-				if _, err := buildCropFilter(crop); err != nil {
-					m.err = err
-				} else {
-					m.cropInput = crop
-					m.textInput.Blur()
-
-					if m.outputMode == modeGIF || m.outputMode == modeAPNG {
-						m.state = stateProcessing
-						m.progressChan = make(chan progressMsg)
-						var codecCfg codecInfo
-						switch m.outputMode {
-						case modeGIF:
-							codecCfg = codecInfo{Name: "GIF", Ext: ".gif"}
-						case modeAPNG:
-							codecCfg = codecInfo{Name: "APNG", Ext: ".png"}
-						}
-
-						return m, tea.Batch(
-							m.spinner.Tick,
-							startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.cropInput, m.customOut, hwCPU, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
-							waitForProgress(m.progressChan),
-						)
-					} else {
-						m.state = stateSelectHW
-					}
-					m.err = nil
-				}
+			switch msg.String() {
+			case "left", "h", "a":
+				m = m.moveCrop(-m.cropStep(false), 0)
+			case "right", "l", "d":
+				m = m.moveCrop(m.cropStep(false), 0)
+			case "up", "k", "w":
+				m = m.moveCrop(0, -m.cropStep(false))
+			case "down", "j", "s":
+				m = m.moveCrop(0, m.cropStep(false))
+			case "shift+left", "ctrl+left", "pgup":
+				m = m.resizeCrop(-m.cropStep(true), 0)
+			case "shift+right", "ctrl+right", "pgdown":
+				m = m.resizeCrop(m.cropStep(true), 0)
+			case "shift+up", "ctrl+up":
+				m = m.resizeCrop(0, -m.cropStep(true))
+			case "shift+down", "ctrl+down":
+				m = m.resizeCrop(0, m.cropStep(true))
+			case "r":
+				m = m.resetCropSelection()
+			case "q":
+				m = m.setSquareCrop()
+			case "n":
+				m.cropEnabled = false
+				m = m.commitCropSelection()
+			case "enter":
+				m = m.commitCropSelection()
+				return m.startAfterCrop()
 			}
+			m = m.commitCropSelection()
+			m.framePreview = m.renderPreviewWithCrop()
 
 		case stateSelectHW:
 			switch msg.String() {
@@ -586,6 +639,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
+		m.videoWidth = msg.width
+		m.videoHeight = msg.height
 		m = m.initializeTrimSelection(msg.duration)
 		return m.loadCurrentPreview()
 
@@ -598,7 +653,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previewError = msg.err.Error()
 			return m, nil
 		}
-		m.framePreview = msg.preview
+		m.previewPixels = msg.pixels
+		m.framePreview = renderANSIFrame(msg.pixels, msg.width, msg.height, nil)
 		m.previewError = ""
 		return m, nil
 
@@ -707,9 +763,21 @@ func (m model) View() string {
 
 	case stateInputCrop:
 		s.WriteString(stepStyle.Render("6. Crop Frame"))
-		s.WriteString("\nLeave empty to keep the full frame.")
-		s.WriteString("\nUse square, WxH, WxH+X+Y, or ffmpeg crop=W:H:X:Y.\n\n")
-		s.WriteString(m.textInput.View())
+		cropLabel := "full frame"
+		if m.cropInput != "" {
+			cropLabel = m.cropInput
+		}
+		s.WriteString(fmt.Sprintf("\nCrop: %s", selectedItemStyle.Render(cropLabel)))
+		s.WriteString("\nDrag inside the box to move it, or drag an edge/corner to resize.")
+		s.WriteString("\nArrow keys move. Shift/Ctrl+Arrows resize. Q square, R reset, N none, Enter continues.\n\n")
+
+		if m.previewLoading && m.framePreview == "" {
+			s.WriteString(itemStyle.Render("Loading frame preview..."))
+		} else if m.previewError != "" {
+			s.WriteString(itemStyle.Render("Preview unavailable: " + m.previewError))
+		} else if m.framePreview != "" {
+			s.WriteString(previewBoxStyle.Render("Crop preview\n" + m.framePreview))
+		}
 
 	case stateSelectHW:
 		s.WriteString(stepStyle.Render("7. Select Hardware"))
@@ -862,14 +930,16 @@ func loadClipInfo(path string) tea.Cmd {
 		if err != nil || duration <= 0 {
 			return clipInfoMsg{err: fmt.Errorf("could not read clip duration")}
 		}
-		return clipInfoMsg{duration: duration}
+
+		width, height := info.videoDimensions()
+		return clipInfoMsg{duration: duration, width: width, height: height}
 	}
 }
 
-func loadFramePreview(path string, at float64, width int, height int) tea.Cmd {
+func loadFramePreview(path string, at float64, width int, height int, seq int) tea.Cmd {
 	return func() tea.Msg {
-		preview, err := renderFramePreview(path, at, width, height)
-		return framePreviewMsg{time: at, width: width, height: height, preview: preview, err: err}
+		pixels, err := renderFramePreview(path, at, width, height)
+		return framePreviewMsg{time: at, width: width, height: height, seq: seq, pixels: pixels, err: err}
 	}
 }
 
@@ -951,12 +1021,13 @@ func (m model) loadCurrentPreview() (model, tea.Cmd) {
 		at = clampFloat(at, 0, math.Max(0, m.videoDuration-0.05))
 	}
 	width, height := m.previewDimensions()
+	m.previewSeq++
 	m.previewTime = at
 	m.previewWidth = width
 	m.previewHeight = height
 	m.previewLoading = true
 	m.previewError = ""
-	return m, loadFramePreview(m.filePath, at, width, height)
+	return m, loadFramePreview(m.filePath, at, width, height, m.previewSeq)
 }
 
 func (m model) handleTrimMouse(msg tea.MouseMsg) (model, tea.Cmd, bool) {
@@ -980,7 +1051,10 @@ func (m model) handleTrimMouse(msg tea.MouseMsg) (model, tea.Cmd, bool) {
 
 	case tea.MouseActionMotion:
 		if !m.trimDragging {
-			return m, nil, false
+			if event.Button != tea.MouseButtonLeft || !m.mouseOnTrimSlider(event.X, event.Y) {
+				return m, nil, false
+			}
+			m.trimDragging = true
 		}
 		m, changed := m.setTrimHandleFromX(event.X, false)
 		if changed {
@@ -994,6 +1068,63 @@ func (m model) handleTrimMouse(msg tea.MouseMsg) (model, tea.Cmd, bool) {
 			return m, nil, false
 		}
 		m.trimDragging = false
+		return m, nil, true
+	}
+
+	return m, nil, false
+}
+
+func (m model) handleCropMouse(msg tea.MouseMsg) (model, tea.Cmd, bool) {
+	if m.state != stateInputCrop || m.previewWidth <= 0 || m.previewHeight <= 0 || len(m.previewPixels) == 0 {
+		return m, nil, false
+	}
+
+	event := tea.MouseEvent(msg)
+	switch event.Action {
+	case tea.MouseActionPress:
+		if event.Button != tea.MouseButtonLeft || !m.mouseOnPreview(event.X, event.Y) {
+			return m, nil, false
+		}
+		m.cropDragMode = m.cropDragModeAt(event.X, event.Y)
+		if m.cropDragMode == cropDragNone {
+			return m, nil, false
+		}
+		m.cropEnabled = true
+		m.cropDragStart.mouseX = event.X
+		m.cropDragStart.mouseY = event.Y
+		m.cropDragStart.x = m.cropX
+		m.cropDragStart.y = m.cropY
+		m.cropDragStart.w = m.cropW
+		m.cropDragStart.h = m.cropH
+		m.framePreview = m.renderPreviewWithCrop()
+		return m, nil, true
+
+	case tea.MouseActionMotion:
+		if m.cropDragMode == cropDragNone {
+			if event.Button != tea.MouseButtonLeft || !m.mouseOnPreview(event.X, event.Y) {
+				return m, nil, false
+			}
+			m.cropDragMode = m.cropDragModeAt(event.X, event.Y)
+			m.cropEnabled = true
+			m.cropDragStart.mouseX = event.X
+			m.cropDragStart.mouseY = event.Y
+			m.cropDragStart.x = m.cropX
+			m.cropDragStart.y = m.cropY
+			m.cropDragStart.w = m.cropW
+			m.cropDragStart.h = m.cropH
+		}
+		m = m.dragCropTo(event.X, event.Y)
+		m = m.commitCropSelection()
+		m.framePreview = m.renderPreviewWithCrop()
+		return m, nil, true
+
+	case tea.MouseActionRelease:
+		if m.cropDragMode == cropDragNone {
+			return m, nil, false
+		}
+		m.cropDragMode = cropDragNone
+		m = m.commitCropSelection()
+		m.framePreview = m.renderPreviewWithCrop()
 		return m, nil, true
 	}
 
@@ -1075,6 +1206,216 @@ func (m model) previewDimensions() (int, int) {
 	return width, height
 }
 
+func (m model) previewOrigin() (int, int) {
+	errorRows := 0
+	if m.err != nil {
+		errorRows = 2
+	}
+	switch m.state {
+	case stateInputCrop:
+		return appMarginX + 2, appMarginY + errorRows + 9
+	default:
+		return appMarginX + 2, appMarginY + errorRows + 10
+	}
+}
+
+func (m model) mouseOnPreview(x int, y int) bool {
+	previewX, previewY := m.previewOrigin()
+	rows := (m.previewHeight + 1) / 2
+	return x >= previewX && x < previewX+m.previewWidth && y >= previewY && y < previewY+rows
+}
+
+func (m model) cropDragModeAt(mouseX int, mouseY int) cropDragMode {
+	cellX, cellY := m.previewMouseToCell(mouseX, mouseY)
+	overlay := m.cropPreviewOverlay()
+
+	if mode, ok := cropHandleAt(cellX, cellY, overlay); ok {
+		return mode
+	}
+	if cropPointInside(cellX, cellY, overlay) {
+		return cropDragMove
+	}
+	return cropDragNone
+}
+
+func (m model) previewMouseToCell(mouseX int, mouseY int) (int, int) {
+	previewX, previewY := m.previewOrigin()
+	x := clampInt(mouseX-previewX, 0, m.previewWidth-1)
+	y := clampInt((mouseY-previewY)*2, 0, m.previewHeight-1)
+	return x, y
+}
+
+func (m model) initializeCropSelection() model {
+	if m.videoWidth <= 0 || m.videoHeight <= 0 {
+		m.cropEnabled = false
+		m.cropInput = ""
+		return m
+	}
+
+	if crop, ok := parseCropInput(m.cropInput, m.videoWidth, m.videoHeight); ok {
+		m.cropEnabled = true
+		m.cropX = crop.x
+		m.cropY = crop.y
+		m.cropW = crop.w
+		m.cropH = crop.h
+	} else {
+		m = m.resetCropSelection()
+	}
+	return m.commitCropSelection()
+}
+
+func (m model) resetCropSelection() model {
+	m.cropEnabled = true
+	m.cropX = 0
+	m.cropY = 0
+	m.cropW = m.videoWidth
+	m.cropH = m.videoHeight
+	return m.commitCropSelection()
+}
+
+func (m model) setSquareCrop() model {
+	if m.videoWidth <= 0 || m.videoHeight <= 0 {
+		return m
+	}
+	side := minInt(m.videoWidth, m.videoHeight)
+	m.cropEnabled = true
+	m.cropW = side
+	m.cropH = side
+	m.cropX = (m.videoWidth - side) / 2
+	m.cropY = (m.videoHeight - side) / 2
+	return m.commitCropSelection()
+}
+
+func (m model) moveCrop(dx int, dy int) model {
+	if !m.cropEnabled {
+		m.cropEnabled = true
+	}
+	m.cropX = clampInt(m.cropX+dx, 0, maxInt(0, m.videoWidth-m.cropW))
+	m.cropY = clampInt(m.cropY+dy, 0, maxInt(0, m.videoHeight-m.cropH))
+	return m.commitCropSelection()
+}
+
+func (m model) resizeCrop(dw int, dh int) model {
+	if !m.cropEnabled {
+		m.cropEnabled = true
+	}
+	m.cropW = clampInt(m.cropW+dw, 2, maxInt(2, m.videoWidth-m.cropX))
+	m.cropH = clampInt(m.cropH+dh, 2, maxInt(2, m.videoHeight-m.cropY))
+	return m.commitCropSelection()
+}
+
+func (m model) dragCropTo(mouseX int, mouseY int) model {
+	cellX, cellY := m.previewMouseToCell(mouseX, mouseY)
+	startCellX, startCellY := m.previewMouseToCell(m.cropDragStart.mouseX, m.cropDragStart.mouseY)
+	dx := previewDeltaToSource(cellX-startCellX, m.previewWidth, m.videoWidth)
+	dy := previewDeltaToSource(cellY-startCellY, m.previewHeight, m.videoHeight)
+	x := m.cropDragStart.x
+	y := m.cropDragStart.y
+	w := m.cropDragStart.w
+	h := m.cropDragStart.h
+
+	switch m.cropDragMode {
+	case cropDragMove:
+		x = clampInt(x+dx, 0, maxInt(0, m.videoWidth-w))
+		y = clampInt(y+dy, 0, maxInt(0, m.videoHeight-h))
+	case cropDragLeft, cropDragTopLeft, cropDragBottomLeft:
+		newX := clampInt(x+dx, 0, x+w-2)
+		w += x - newX
+		x = newX
+	}
+	switch m.cropDragMode {
+	case cropDragRight, cropDragTopRight, cropDragBottomRight:
+		w = clampInt(w+dx, 2, m.videoWidth-x)
+	}
+	switch m.cropDragMode {
+	case cropDragTop, cropDragTopLeft, cropDragTopRight:
+		newY := clampInt(y+dy, 0, y+h-2)
+		h += y - newY
+		y = newY
+	}
+	switch m.cropDragMode {
+	case cropDragBottom, cropDragBottomLeft, cropDragBottomRight:
+		h = clampInt(h+dy, 2, m.videoHeight-y)
+	}
+
+	m.cropEnabled = true
+	m.cropX = clampInt(x, 0, maxInt(0, m.videoWidth-2))
+	m.cropY = clampInt(y, 0, maxInt(0, m.videoHeight-2))
+	m.cropW = clampInt(w, 2, maxInt(2, m.videoWidth-m.cropX))
+	m.cropH = clampInt(h, 2, maxInt(2, m.videoHeight-m.cropY))
+	return m
+}
+
+func (m model) commitCropSelection() model {
+	if !m.cropEnabled || m.videoWidth <= 0 || m.videoHeight <= 0 {
+		m.cropInput = ""
+		return m
+	}
+	m.cropX = clampInt(m.cropX, 0, maxInt(0, m.videoWidth-2))
+	m.cropY = clampInt(m.cropY, 0, maxInt(0, m.videoHeight-2))
+	m.cropW = evenInt(clampInt(m.cropW, 2, maxInt(2, m.videoWidth-m.cropX)))
+	m.cropH = evenInt(clampInt(m.cropH, 2, maxInt(2, m.videoHeight-m.cropY)))
+	if m.cropX == 0 && m.cropY == 0 && m.cropW >= evenInt(m.videoWidth) && m.cropH >= evenInt(m.videoHeight) {
+		m.cropInput = ""
+		return m
+	}
+	m.cropInput = fmt.Sprintf("crop=%d:%d:%d:%d", m.cropW, m.cropH, m.cropX, m.cropY)
+	return m
+}
+
+func (m model) renderPreviewWithCrop() string {
+	if len(m.previewPixels) == 0 || m.previewWidth <= 0 || m.previewHeight <= 0 {
+		return m.framePreview
+	}
+	overlay := m.cropPreviewOverlay()
+	return renderANSIFrame(m.previewPixels, m.previewWidth, m.previewHeight, &overlay)
+}
+
+func (m model) cropPreviewOverlay() previewOverlay {
+	if !m.cropEnabled || m.videoWidth <= 0 || m.videoHeight <= 0 {
+		return previewOverlay{x: 0, y: 0, w: m.previewWidth, h: m.previewHeight, dimOutside: false}
+	}
+	x := int(math.Round(float64(m.cropX) / float64(m.videoWidth) * float64(m.previewWidth)))
+	y := int(math.Round(float64(m.cropY) / float64(m.videoHeight) * float64(m.previewHeight)))
+	w := int(math.Round(float64(m.cropW) / float64(m.videoWidth) * float64(m.previewWidth)))
+	h := int(math.Round(float64(m.cropH) / float64(m.videoHeight) * float64(m.previewHeight)))
+	x = clampInt(x, 0, maxInt(0, m.previewWidth-2))
+	y = clampInt(y, 0, maxInt(0, m.previewHeight-2))
+	w = clampInt(w, 2, m.previewWidth-x)
+	h = clampInt(h, 2, m.previewHeight-y)
+	return previewOverlay{x: x, y: y, w: w, h: h, sourceWidth: m.videoWidth, sourceHeight: m.videoHeight, dimOutside: true}
+}
+
+func (m model) cropStep(big bool) int {
+	base := maxInt(1, minInt(m.videoWidth, m.videoHeight)/200)
+	if big {
+		base = maxInt(8, minInt(m.videoWidth, m.videoHeight)/40)
+	}
+	return evenInt(base)
+}
+
+func (m model) startAfterCrop() (tea.Model, tea.Cmd) {
+	if m.outputMode == modeGIF || m.outputMode == modeAPNG {
+		m.state = stateProcessing
+		m.progressChan = make(chan progressMsg)
+		var codecCfg codecInfo
+		switch m.outputMode {
+		case modeGIF:
+			codecCfg = codecInfo{Name: "GIF", Ext: ".gif"}
+		case modeAPNG:
+			codecCfg = codecInfo{Name: "APNG", Ext: ".png"}
+		}
+
+		return m, tea.Batch(
+			m.spinner.Tick,
+			startEncoding(m.filePath, m.targetSizeMB, m.targetRes, m.targetFPS, m.trimStart, m.trimEnd, m.cropInput, m.customOut, hwCPU, codecCfg, m.progressChan, m.outputMode, m.qualityLevel, m.crfLevel),
+			waitForProgress(m.progressChan),
+		)
+	}
+	m.state = stateSelectHW
+	return m, nil
+}
+
 func (m model) renderTrimSlider(width int) string {
 	if width < 12 {
 		width = 12
@@ -1112,9 +1453,9 @@ func (m model) renderTrimSlider(width int) string {
 	return b.String()
 }
 
-func renderFramePreview(path string, at float64, width int, height int) (string, error) {
+func renderFramePreview(path string, at float64, width int, height int) ([]byte, error) {
 	if width <= 0 || height <= 0 {
-		return "", fmt.Errorf("invalid preview size")
+		return nil, fmt.Errorf("invalid preview size")
 	}
 
 	args := []string{
@@ -1131,13 +1472,16 @@ func renderFramePreview(path string, at float64, width int, height int) (string,
 	cmd := exec.Command("ffmpeg", args...)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	needed := width * height * 3
 	if len(out) < needed {
-		return "", fmt.Errorf("ffmpeg returned an incomplete preview frame")
+		return nil, fmt.Errorf("ffmpeg returned an incomplete preview frame")
 	}
+	return out[:needed], nil
+}
 
+func renderANSIFrame(pixels []byte, width int, height int, overlay *previewOverlay) string {
 	var b strings.Builder
 	for y := 0; y < height; y += 2 {
 		for x := 0; x < width; x++ {
@@ -1147,7 +1491,13 @@ func renderFramePreview(path string, at float64, width int, height int) (string,
 			if bottomY < height {
 				bottom = (bottomY*width + x) * 3
 			}
-			b.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", out[top], out[top+1], out[top+2], out[bottom], out[bottom+1], out[bottom+2]))
+			topR, topG, topB := pixels[top], pixels[top+1], pixels[top+2]
+			bottomR, bottomG, bottomB := pixels[bottom], pixels[bottom+1], pixels[bottom+2]
+			if overlay != nil {
+				topR, topG, topB = applyOverlayColor(topR, topG, topB, x, y, *overlay)
+				bottomR, bottomG, bottomB = applyOverlayColor(bottomR, bottomG, bottomB, x, bottomY, *overlay)
+			}
+			b.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", topR, topG, topB, bottomR, bottomG, bottomB))
 		}
 		b.WriteString("\x1b[0m")
 		if y+2 < height {
@@ -1155,7 +1505,7 @@ func renderFramePreview(path string, at float64, width int, height int) (string,
 		}
 	}
 
-	return b.String(), nil
+	return b.String()
 }
 
 func formatDuration(sec float64) string {
@@ -1197,11 +1547,106 @@ func clampInt(value, min, max int) int {
 	return value
 }
 
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func evenInt(value int) int {
+	if value < 2 {
+		return 2
+	}
+	if value%2 != 0 {
+		value--
+	}
+	return maxInt(2, value)
+}
+
+func previewDeltaToSource(delta int, previewSize int, sourceSize int) int {
+	if previewSize <= 0 || sourceSize <= 0 || delta == 0 {
+		return 0
+	}
+	return int(math.Round(float64(delta) / float64(previewSize) * float64(sourceSize)))
+}
+
 func labelForHandle(label string, active bool) string {
 	if active {
 		return selectedItemStyle.Render(label)
 	}
 	return itemStyle.Render(label)
+}
+
+func applyOverlayColor(r, g, b byte, x int, y int, overlay previewOverlay) (byte, byte, byte) {
+	inside := x >= overlay.x && x < overlay.x+overlay.w && y >= overlay.y && y < overlay.y+overlay.h
+	border := inside && (x == overlay.x || x == overlay.x+overlay.w-1 || y == overlay.y || y == overlay.y+overlay.h-1)
+
+	if cropPointOnHandle(x, y, overlay) {
+		return 255, 255, 255
+	}
+	if border {
+		return 88, 101, 242
+	}
+	if overlay.dimOutside && !inside {
+		return byte(float64(r) * 0.35), byte(float64(g) * 0.35), byte(float64(b) * 0.35)
+	}
+	return r, g, b
+}
+
+func cropPointInside(x int, y int, overlay previewOverlay) bool {
+	return x >= overlay.x && x < overlay.x+overlay.w && y >= overlay.y && y < overlay.y+overlay.h
+}
+
+func cropPointOnHandle(x int, y int, overlay previewOverlay) bool {
+	for _, handle := range cropHandles(overlay) {
+		if x == handle.x && y == handle.y {
+			return true
+		}
+	}
+	return false
+}
+
+func cropHandleAt(x int, y int, overlay previewOverlay) (cropDragMode, bool) {
+	for _, handle := range cropHandles(overlay) {
+		if absInt(x-handle.x) <= 1 && absInt(y-handle.y) <= 1 {
+			return handle.mode, true
+		}
+	}
+	return cropDragNone, false
+}
+
+func cropHandles(overlay previewOverlay) []cropHandle {
+	left := overlay.x
+	right := overlay.x + overlay.w - 1
+	top := overlay.y
+	bottom := overlay.y + overlay.h - 1
+	midX := overlay.x + overlay.w/2
+	midY := overlay.y + overlay.h/2
+	return []cropHandle{
+		{x: left, y: top, mode: cropDragTopLeft},
+		{x: midX, y: top, mode: cropDragTop},
+		{x: right, y: top, mode: cropDragTopRight},
+		{x: left, y: midY, mode: cropDragLeft},
+		{x: right, y: midY, mode: cropDragRight},
+		{x: left, y: bottom, mode: cropDragBottomLeft},
+		{x: midX, y: bottom, mode: cropDragBottom},
+		{x: right, y: bottom, mode: cropDragBottomRight},
+	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func buildScaleFilter(input string) string {
@@ -1315,6 +1760,42 @@ func buildCropFilter(input string) (string, error) {
 	}
 
 	return "", fmt.Errorf("crop must be empty, square, WxH, WxH+X+Y, or crop=W:H:X:Y")
+}
+
+type cropRect struct {
+	x int
+	y int
+	w int
+	h int
+}
+
+func parseCropInput(input string, videoWidth int, videoHeight int) (cropRect, bool) {
+	filter, err := buildCropFilter(input)
+	if err != nil || filter == "" || strings.Contains(filter, "min(") {
+		return cropRect{}, false
+	}
+	filter = strings.TrimPrefix(filter, "crop=")
+	parts := strings.Split(filter, ":")
+	if len(parts) != 4 {
+		return cropRect{}, false
+	}
+	values := make([]int, 4)
+	for i, part := range parts {
+		value, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil {
+			return cropRect{}, false
+		}
+		values[i] = value
+	}
+	if values[0] <= 0 || values[1] <= 0 || values[2] < 0 || values[3] < 0 || values[2] >= videoWidth || values[3] >= videoHeight {
+		return cropRect{}, false
+	}
+	return cropRect{
+		x: clampInt(values[2], 0, maxInt(0, videoWidth-2)),
+		y: clampInt(values[3], 0, maxInt(0, videoHeight-2)),
+		w: evenInt(clampInt(values[0], 2, maxInt(2, videoWidth-values[2]))),
+		h: evenInt(clampInt(values[1], 2, maxInt(2, videoHeight-values[3]))),
+	}, true
 }
 
 func splitDimension(input string) []string {
@@ -1815,10 +2296,24 @@ func findMatches(input string) []string {
 type FFProbeOutput struct {
 	Streams []struct {
 		CodecType string `json:"codec_type"`
+		Width     int    `json:"width"`
+		Height    int    `json:"height"`
 	} `json:"streams"`
 	Format struct {
 		Duration string `json:"duration"`
 	} `json:"format"`
+}
+
+func (info *FFProbeOutput) videoDimensions() (int, int) {
+	if info == nil {
+		return 0, 0
+	}
+	for _, stream := range info.Streams {
+		if stream.CodecType == "video" && stream.Width > 0 && stream.Height > 0 {
+			return stream.Width, stream.Height
+		}
+	}
+	return 0, 0
 }
 
 func probeFile(path string) (*FFProbeOutput, error) {
@@ -1873,9 +2368,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(outputMode), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
+	p := tea.NewProgram(initialModel(outputMode), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	finalModel, err := p.Run()
+	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	if m, ok := finalModel.(model); ok {
+		switch m.state {
+		case stateDone:
+			fmt.Println(doneStyle.Render("Success!"))
+			fmt.Printf("\nSaved to:\n%s\n%s\n", m.outputFile, m.finalSize)
+		case stateError:
+			fmt.Println(errStyle.Render("Failed."))
+			if m.err != nil {
+				fmt.Printf("%v\n", m.err)
+			}
+		}
 	}
 }
